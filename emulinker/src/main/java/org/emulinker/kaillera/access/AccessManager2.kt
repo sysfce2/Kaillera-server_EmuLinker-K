@@ -44,6 +44,7 @@ class AccessManager2(private val flags: RuntimeFlags, private val taskScheduler:
   private val tempModeratorList: MutableList<TempModerator> = CopyOnWriteArrayList()
   private val tempElevatedList: MutableList<TempElevated> = CopyOnWriteArrayList()
   private val silenceList: MutableList<Silence> = CopyOnWriteArrayList()
+  private val permaSilenceList: MutableList<SilenceAccess> = CopyOnWriteArrayList()
 
   private val timerTasks = mutableSetOf<ScheduledFuture<*>>()
 
@@ -64,6 +65,7 @@ class AccessManager2(private val flags: RuntimeFlags, private val taskScheduler:
     gameList.clear()
     emulatorList.clear()
     addressList.clear()
+    permaSilenceList.clear()
     try {
       val file = FileInputStream(af)
       val temp: Reader = InputStreamReader(file, flags.charset)
@@ -72,16 +74,25 @@ class AccessManager2(private val flags: RuntimeFlags, private val taskScheduler:
       while (reader.readLine().also { line = it } != null) {
         if (line.isNullOrBlank() || line!!.startsWith("#") || line!!.startsWith("//")) continue
         val st = StringTokenizer(line, ",")
-        if (st.countTokens() < 3) {
+        val tokenCount = st.countTokens()
+        if (tokenCount < 2) {
           logger.atSevere().log("Failed to load access line, too few tokens: %s", line)
           continue
         }
         val type = st.nextToken()
+        // silence lines have the format `silence,<address>` (2 tokens total, 1 remaining after
+        // type)
+        // all other lines need at least 2 more tokens (3 total)
+        if (type.lowercase() != "silence" && tokenCount < 3) {
+          logger.atSevere().log("Failed to load access line, too few tokens: %s", line)
+          continue
+        }
         when (type.lowercase()) {
           "user" -> userList.add(UserAccess(st))
           "game" -> gameList.add(GameAccess(st))
           "emulator" -> emulatorList.add(EmulatorAccess(st))
           "ipaddress" -> addressList.add(AddressAccess(st))
+          "silence" -> permaSilenceList.add(SilenceAccess(st))
           else ->
             logger
               .atSevere()
@@ -94,8 +105,13 @@ class AccessManager2(private val flags: RuntimeFlags, private val taskScheduler:
     }
   }
 
-  override fun addTempBan(addressPattern: String, duration: Duration) {
-    addTemporaryAttributeToList(tempBanList, TempBan(addressPattern, duration))
+  override fun addTempBan(
+    addressPattern: String,
+    duration: Duration,
+    issuer: String?,
+    reason: String?,
+  ) {
+    addTemporaryAttributeToList(tempBanList, TempBan(addressPattern, duration, issuer, reason))
   }
 
   override fun addTempAdmin(addressPattern: String, duration: Duration) {
@@ -110,8 +126,57 @@ class AccessManager2(private val flags: RuntimeFlags, private val taskScheduler:
     addTemporaryAttributeToList(tempElevatedList, TempElevated(addressPattern, duration))
   }
 
-  override fun addSilenced(addressPattern: String, duration: Duration) {
-    addTemporaryAttributeToList(silenceList, Silence(addressPattern, duration))
+  override fun addSilenced(
+    addressPattern: String,
+    duration: Duration,
+    issuer: String?,
+    reason: String?,
+  ) {
+    addTemporaryAttributeToList(silenceList, Silence(addressPattern, duration, issuer, reason))
+  }
+
+  @Synchronized
+  override fun addPermaBan(addressPattern: String, issuer: String?, reason: String?) {
+    val file = accessFile ?: return
+    try {
+      java.io.FileWriter(file, true).use { writer ->
+        writer.appendLine()
+        writer.appendLine("# Permanent ban issued by ${issuer ?: "Unknown"}")
+        if (reason != null) writer.appendLine("# Reason: $reason")
+        writer.appendLine("ipaddress,DENY,$addressPattern")
+      }
+      loadAccess()
+    } catch (e: Exception) {
+      logger.atSevere().withCause(e).log("Failed to write to access file")
+    }
+  }
+
+  @Synchronized
+  override fun addPermaMute(addressPattern: String, issuer: String?, reason: String?) {
+    val file = accessFile ?: return
+    try {
+      java.io.FileWriter(file, true).use { writer ->
+        writer.appendLine()
+        writer.appendLine("# Permanent silence issued by ${issuer ?: "Unknown"}")
+        if (reason != null) writer.appendLine("# Reason: $reason")
+        writer.appendLine("silence,$addressPattern")
+      }
+      loadAccess()
+    } catch (e: Exception) {
+      logger.atSevere().withCause(e).log("Failed to write to access file")
+    }
+  }
+
+  override fun getTempBan(address: InetAddress): TempBan? {
+    checkReload()
+    val userAddress = address.hostAddress
+    return tempBanList.firstOrNull { it.matches(userAddress) && !it.isExpired }
+  }
+
+  override fun getSilence(address: InetAddress): Silence? {
+    checkReload()
+    val userAddress = address.hostAddress
+    return silenceList.firstOrNull { it.matches(userAddress) && !it.isExpired }
   }
 
   private fun <T : TemporaryAttribute> addTemporaryAttributeToList(
@@ -199,6 +264,9 @@ class AccessManager2(private val flags: RuntimeFlags, private val taskScheduler:
     val userAddress = address.hostAddress
     for (silence in silenceList) {
       if (silence.matches(userAddress) && !silence.isExpired) return true
+    }
+    for (silence in permaSilenceList) {
+      if (silence.matches(userAddress)) return true
     }
     return false
   }
@@ -437,6 +505,69 @@ class AccessManager2(private val flags: RuntimeFlags, private val taskScheduler:
     }
   }
 
+  private class SilenceAccess(st: StringTokenizer) {
+    private var hostNames: MutableList<String>
+    private var resolvedAddresses: MutableList<String>
+
+    @Synchronized
+    fun refreshDNS() {
+      resolvedAddresses.clear()
+      for (hostName in hostNames) {
+        try {
+          val address = InetAddress.getByName(hostName)
+          resolvedAddresses.add(address.hostAddress)
+        } catch (e: Exception) {
+          logger
+            .atFine()
+            .withCause(e)
+            .log("Failed to resolve DNS entry to an address: %s", hostName)
+        }
+      }
+    }
+
+    private var patterns: MutableList<WildcardStringPattern>
+
+    @Synchronized
+    fun matches(address: String): Boolean {
+      for (pattern in patterns) {
+        if (pattern.match(address)) return true
+      }
+      for (resolvedAddress in resolvedAddresses) {
+        if (resolvedAddress == address) return true
+      }
+      return false
+    }
+
+    init {
+      if (st.countTokens() != 1) throw Exception("Wrong number of tokens: " + st.countTokens())
+      hostNames = ArrayList()
+      resolvedAddresses = ArrayList()
+      patterns = ArrayList()
+      val s = st.nextToken().lowercase(Locale.getDefault())
+      val pt = StringTokenizer(s, "|")
+      while (pt.hasMoreTokens()) {
+        val pat = pt.nextToken().lowercase(Locale.getDefault())
+        if (pat.startsWith("dns:")) {
+          if (pat.length <= 5) throw AccessException("Malformatted DNS entry: $s")
+          val hostName = pat.substring(4)
+          try {
+            val a = InetAddress.getByName(hostName)
+            logger.atFine().log("Resolved %s to %s", hostName, a.hostAddress)
+          } catch (e: Exception) {
+            logger
+              .atWarning()
+              .withCause(e)
+              .log("Failed to resolve DNS entry to an address: %s", hostName)
+          }
+          hostNames.add(pat.substring(4))
+        } else {
+          patterns.add(WildcardStringPattern(pat))
+        }
+      }
+      refreshDNS()
+    }
+  }
+
   init {
     val url = AccessManager2::class.java.getResource("/access.cfg")
     requireNotNull(url) { "Resource not found: /access.conf" }
@@ -463,6 +594,7 @@ class AccessManager2(private val flags: RuntimeFlags, private val taskScheduler:
       ) {
         userList.forEach { it.refreshDNS() }
         addressList.forEach { it.refreshDNS() }
+        permaSilenceList.forEach { it.refreshDNS() }
       }
     )
   }
